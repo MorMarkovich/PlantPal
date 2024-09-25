@@ -9,6 +9,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -45,16 +46,21 @@ class AddPlantFragment : Fragment() {
     private lateinit var auth: FirebaseAuth
 
     private var imageCapture: ImageCapture? = null
-    private lateinit var cameraExecutor: ExecutorService
+    private var cameraExecutor: ExecutorService? = null
+
+
 
     private var photoUri: Uri? = null
     private var plantId: String? = null
     private var environmentId: String? = null
     private var imageUrl: String? = null
 
+
     private val args: AddPlantFragmentArgs by navArgs()
 
     private var userRole: String = ""
+    private lateinit var loadingSpinner: LoadingSpinner
+
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -78,47 +84,46 @@ class AddPlantFragment : Fragment() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        arguments?.let {
-            plantId = it.getString("plantId")
-            environmentId = it.getString("environmentId")
-        }
+        Log.d("AddPlantFragment", "onCreate called")
+        plantId = args.plantId
+        environmentId = args.environmentId
+
+        Log.d("AddPlantFragment", "Received args - plantId: $plantId, environmentId: $environmentId")
 
         if (environmentId == null) {
+            Log.d("AddPlantFragment", "Environment ID is null, fetching from SharedPreferences")
             environmentId = getCurrentEnvironmentId()
         }
-    }
+        Log.d("AddPlantFragment", "Final Environment ID set to: $environmentId")
 
-    private fun getCurrentEnvironmentId(): String? {
-        val sharedPref = activity?.getPreferences(android.content.Context.MODE_PRIVATE) ?: return null
-        return sharedPref.getString("current_environment_id", null)
-    }
-
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
-        _binding = FragmentAddPlantBinding.inflate(inflater, container, false)
-        return binding.root
-    }
-
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-
+        // Initialize Firebase instances
         auth = FirebaseAuth.getInstance()
         db = FirebaseFirestore.getInstance()
         storage = FirebaseStorage.getInstance()
+    }
 
-        args.let {
-            plantId = it.plantId
-            environmentId = it.environmentId
-        }
+    private fun getCurrentEnvironmentId(): String? {
+        val sharedPref = activity?.getPreferences(android.content.Context.MODE_PRIVATE)
+        val id = sharedPref?.getString("current_environment_id", null)
+        Log.d("AddPlantFragment", "Retrieved environment ID from SharedPreferences: $id")
+        return id
+    }
 
-        if (environmentId == null) {
-            environmentId = getCurrentEnvironmentId()
-        }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentAddPlantBinding.inflate(inflater, container, false)
+        loadingSpinner = LoadingSpinner(requireContext())
+        return binding.root
+    }
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        Log.d("AddPlantFragment", "onViewCreated called")
+
+        Log.d("AddPlantFragment", "Current environment ID: $environmentId")
 
         setupUI()
         setupListeners()
-
-        cameraExecutor = Executors.newSingleThreadExecutor()
-
+        setUsername()
         if (plantId != null) {
             loadPlantData(plantId!!)
         }
@@ -136,6 +141,10 @@ class AddPlantFragment : Fragment() {
 
     private fun setupListeners() {
         binding.buttonTakePhoto.setOnClickListener {
+            initializeCameraExecutor()
+            requestCameraPermission()
+        }
+        binding.buttonTakePhoto.setOnClickListener {
             requestCameraPermission()
         }
 
@@ -145,6 +154,11 @@ class AddPlantFragment : Fragment() {
 
         binding.buttonSave.setOnClickListener {
             savePlant()
+        }
+    }
+    private fun initializeCameraExecutor() {
+        if (cameraExecutor == null) {
+            cameraExecutor = Executors.newSingleThreadExecutor()
         }
     }
 
@@ -344,12 +358,21 @@ class AddPlantFragment : Fragment() {
         }
     }
 
+    private fun setUsername() {
+        val currentUser = FirebaseAuth.getInstance().currentUser
+        currentUser?.let { user ->
+            val displayName = user.displayName ?: "User"
+            view?.findViewById<TextView>(R.id.textViewUsername)?.text = "Hello $displayName"
+        }
+    }
+
     private fun savePlant() {
         val plantName = binding.editTextPlantName.text.toString()
         val wateringFrequency = binding.numberPickerFrequency.value
         val frequencyPeriod = binding.spinnerFrequency.selectedItem.toString()
         val notes = binding.editTextNotes.text.toString()
         val tags = binding.editTextTags.text.toString().split(",").map { it.trim() }
+
         val currentUser = auth.currentUser
         if (currentUser == null) {
             showSnackbar("User not authenticated. Please log in again.")
@@ -362,17 +385,18 @@ class AddPlantFragment : Fragment() {
             return
         }
 
+        if (environmentId == null) {
+            Log.e("AddPlantFragment", "Attempting to save plant without an environment ID")
+            showSnackbar("No environment selected. Please go back and select an environment.")
+            return
+        }
+
+        Log.d("AddPlantFragment", "Saving plant with environment ID: $environmentId")
+
+        loadingSpinner.show()
         lifecycleScope.launch {
             try {
-                // Refresh the token before performing the operation
                 refreshTokenIfNeeded()
-
-                val currentUser = auth.currentUser
-                if (currentUser == null) {
-                    showSnackbar("User not authenticated. Please log in again.")
-                    // Navigate to login screen or handle re-authentication
-                    return@launch
-                }
 
                 val plant = hashMapOf(
                     "name" to plantName,
@@ -381,12 +405,13 @@ class AddPlantFragment : Fragment() {
                     "notes" to notes,
                     "tags" to tags,
                     "creatorId" to currentUser.uid,
-                    "environmentId" to (environmentId ?: "")
+                    "environmentId" to environmentId
                 )
+
+                Log.d("AddPlantFragment", "Saving plant with environment ID: $environmentId")
 
                 val documentId = plantId ?: db.collection("plants").document().id
 
-                // If a new photo was taken, upload it. Otherwise, use the existing imageUrl
                 val finalImageUrl = if (photoUri != null) {
                     uploadImage(documentId, photoUri!!)
                 } else {
@@ -397,19 +422,25 @@ class AddPlantFragment : Fragment() {
                 withContext(Dispatchers.IO) {
                     db.collection("plants").document(documentId).set(plant).await()
                 }
-
-                showSnackbar("Plant saved successfully")
-                findNavController().popBackStack()
-            } catch (e: Exception) {
-                when (e) {
-                    is IllegalStateException -> showSnackbar("User not logged in. Please log in and try again.")
-                    else -> showSnackbar("Error saving plant: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    loadingSpinner.dismiss()
+                    showSnackbar("Plant saved successfully")
+                    findNavController().popBackStack()
                 }
-                Log.e("AddPlantFragment", "Error saving plant", e)
+                //showSnackbar("Plant saved successfully")
+                //findNavController().popBackStack()
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    loadingSpinner.dismiss()
+                    when (e) {
+                        is IllegalStateException -> showSnackbar("User not logged in. Please log in and try again.")
+                        else -> showSnackbar("Error saving plant: ${e.message}")
+                    }
+                    Log.e("AddPlantFragment", "Error saving plant", e)
+                }
             }
         }
     }
-
 
     private suspend fun uploadImage(plantId: String, imageUri: Uri): String {
         return withContext(Dispatchers.IO) {
@@ -431,7 +462,9 @@ class AddPlantFragment : Fragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
-        cameraExecutor.shutdown()
+        cameraExecutor?.shutdown()
+        cameraExecutor = null
         _binding = null
     }
+
 }
